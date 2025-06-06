@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import json
+import openai
 import uuid
 import queue
 import wave
@@ -32,8 +33,42 @@ import sounddevice as sd
 import soundfile as sf
 import speech_recognition as sr
 import soundcard as sc
-from PIL import Image, ImageTk, ImageGrab, ImageEnhance, ImageFilter
+from PIL import Image, ImageTk, ImageGrab, ImageEnhance, ImageFilter, ImageDraw, ImageFont
 from textblob import TextBlob
+
+# Initialize Groq client (set your API key in environment variables)
+class LLMClient:
+    def __init__(self, api_key: Optional[str] = None):
+        from groq import Groq
+        self.client = Groq(api_key=os.getenv('GROQ_API_KEY', api_key))
+        self.available_models = [
+            "llama3-8b-8192",
+            "llama3-70b-8192",
+            "mixtral-8x7b-32768"
+        ]
+    
+    def get_response(self, prompt: str, model: str = None) -> str:
+        try:
+            # Use the first available model if none specified
+            model_to_use = model or self.available_models[0]
+            
+            response = self.client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model=model_to_use,
+                temperature=0.7,
+                max_tokens=1024,
+                top_p=1,
+                stream=False,
+                stop=None,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            # Try next available model if one fails
+            if not model and len(self.available_models) > 1:
+                print(f"Error with model {model_to_use}, trying next available model...")
+                self.available_models.pop(0)
+                return self.get_response(prompt)
+            return f"Error getting LLM response: {str(e)}"
 
 # Debug print
 print("1. Starting ScreenReader application...")
@@ -83,21 +118,40 @@ Installation Steps:
 
 class ScreenOverlay:
     def on_close(self):
-        """Handle window close event"""
-        # Set flag to stop all threads
+        """Handle window close event and clean up resources."""
         self.running = False
         self.is_capturing = False
-        self.is_recording = False
+        self.recording = False
         
-        # Wait for recording thread to finish
+        # Stop any ongoing recordings
         if hasattr(self, 'recording_thread') and self.recording_thread:
             if self.recording_thread.is_alive():
                 self.recording_thread.join(timeout=1.0)
         
-        # Destroy the window
-        self.root.quit()
-        self.root.destroy()
+        # Close LLM overlay if open
+        if hasattr(self, 'llm_overlay') and self.llm_overlay:
+            try:
+                self.llm_overlay.destroy()
+            except:
+                pass
+        
+        # Close the main window
+        if hasattr(self, 'root') and self.root:
+            try:
+                self.root.quit()
+                self.root.destroy()
+            except:
+                pass
     
+    def __init__(self, root=None):
+        print("Initializing ScreenOverlay...")
+        self.root = root or tk.Tk()
+        self.running = True
+        self.llm_client = LLMClient()  # Initialize LLM client
+        self.llm_overlay = None  # Will hold the overlay window
+        self.setup_ui()
+        self.setup_hotkeys()
+        print("ScreenOverlay initialization complete.")
     def __init__(self):
         # Initialize main window
         self.root = tk.Tk()
@@ -106,9 +160,13 @@ class ScreenOverlay:
         try:
             # Set window attributes
             self.root.title("Screen Data Overlay")
-            self.root.attributes('-alpha', 0.7)
+            self.root.attributes('-alpha', 0.9)
             self.root.attributes('-topmost', True)
             self.root.overrideredirect(True)  # Remove window decorations
+            
+            # Initialize LLM client
+            self.llm_client = LLMClient()  # Will use OPENAI_API_KEY from environment
+            self.llm_overlay = None  # Will hold the LLM overlay window
             
             # Get screen dimensions
             temp_root = tk.Tk()
@@ -174,7 +232,16 @@ class ScreenOverlay:
         """Set up the user interface."""
         # Create a draggable control panel
         self.control_panel = tk.Frame(self.root, bg='#f0f0f0', bd=2, relief='raised')
-        self.control_panel.place(x=20, y=20, width=300, height=400)
+        self.control_panel.place(x=20, y=20, width=300, height=450)  # Increased height for LLM button
+        
+        # Add LLM button to control panel
+        self.llm_button = ttk.Button(
+            self.control_panel, 
+            text="Ask LLM", 
+            command=self.toggle_llm_overlay,
+            width=20
+        )
+        self.llm_button.pack(fill='x', padx=5, pady=5)
         
         # Create notification label (floating, not inside control panel)
         self.notification_label = tk.Label(
@@ -1863,6 +1930,120 @@ class ScreenOverlay:
             print(f"Error in update loop: {e}")
             if hasattr(self, 'root') and self.running:
                 self.root.after(100, self.update)
+    
+    def toggle_llm_overlay(self):
+        """Toggle the LLM overlay window."""
+        if hasattr(self, 'llm_overlay') and self.llm_overlay and self.llm_overlay.winfo_exists():
+            self.llm_overlay.destroy()
+            self.llm_overlay = None
+        else:
+            self.create_llm_overlay()
+    
+    def create_llm_overlay(self):
+        """Create the LLM overlay window."""
+        self.llm_overlay = tk.Toplevel(self.root)
+        self.llm_overlay.overrideredirect(True)
+        self.llm_overlay.attributes('-topmost', True)
+        self.llm_overlay.geometry('400x300+500+100')
+        self.llm_overlay.configure(bg='#2c3e50')
+        
+        # Make window draggable
+        def start_move(event):
+            self.llm_overlay.x = event.x
+            self.llm_overlay.y = event.y
+
+        def stop_move(event):
+            self.llm_overlay.x = None
+            self.llm_overlay.y = None
+
+        def do_move(event):
+            deltax = event.x - self.llm_overlay.x
+            deltay = event.y - self.llm_overlay.y
+            x = self.llm_overlay.winfo_x() + deltax
+            y = self.llm_overlay.winfo_y() + deltay
+            self.llm_overlay.geometry(f"+{x}+{y}")
+            
+        # Title bar
+        title_bar = tk.Frame(self.llm_overlay, bg='#34495e', relief='raised', bd=1)
+        title_bar.pack(fill='x')
+        
+        title_label = tk.Label(title_bar, text="LLM Assistant", bg='#34495e', fg='white')
+        title_label.pack(side='left', padx=5)
+        
+        close_btn = tk.Label(title_bar, text='×', bg='#34495e', fg='white', cursor='hand2')
+        close_btn.pack(side='right', padx=5)
+        close_btn.bind('<Button-1>', lambda e: self.llm_overlay.destroy())
+        
+        title_bar.bind('<Button-1>', start_move)
+        title_bar.bind('<B1-Motion>', do_move)
+        title_bar.bind('<ButtonRelease-1>', stop_move)
+        
+        # Input area
+        input_frame = tk.Frame(self.llm_overlay, bg='#2c3e50', padx=5, pady=5)
+        input_frame.pack(fill='x', side='bottom')
+        
+        self.llm_input = scrolledtext.ScrolledText(input_frame, height=3, width=40, wrap=tk.WORD)
+        self.llm_input.pack(fill='x', pady=(0, 5))
+        
+        send_btn = ttk.Button(
+            input_frame, 
+            text="Send", 
+            command=self.send_to_llm,
+            width=10
+        )
+        send_btn.pack(side='right')
+        
+        # Response area
+        response_frame = tk.Frame(self.llm_overlay, bg='#2c3e50')
+        response_frame.pack(fill='both', expand=True, padx=5, pady=5)
+        
+        self.llm_response = scrolledtext.ScrolledText(
+            response_frame, 
+            wrap=tk.WORD, 
+            bg='#34495e', 
+            fg='white',
+            insertbackground='white',
+            font=('Arial', 10)
+        )
+        self.llm_response.pack(fill='both', expand=True)
+        self.llm_response.config(state='disabled')
+        
+        # Bind Enter key to send message (Shift+Enter for new line)
+        self.llm_input.bind('<Return>', lambda e: 'break' if not e.state else self.send_to_llm())
+        self.llm_input.bind('<Shift-Return>', lambda e: self.llm_input.insert(tk.END, '\n'))
+    
+    def send_to_llm(self):
+        """Send the current input to the LLM and display the response."""
+        user_input = self.llm_input.get('1.0', tk.END).strip()
+        if not user_input:
+            return
+            
+        # Add user message to chat
+        self.add_message("You", user_input)
+        self.llm_input.delete('1.0', tk.END)
+        
+        # Get LLM response (in a separate thread to avoid freezing the UI)
+        def get_llm_response():
+            try:
+                # Add context from the last capture if available
+                context = ""
+                if hasattr(self, 'last_ocr_text') and self.last_ocr_text:
+                    context = f"Context from screen: {self.last_ocr_text[:1000]}\n\n"
+                
+                response = self.llm_client.get_response(f"{context}Question: {user_input}")
+                self.add_message("Assistant", response)
+            except Exception as e:
+                self.add_message("Error", f"Failed to get LLM response: {str(e)}")
+        
+        # Start the LLM request in a separate thread
+        threading.Thread(target=get_llm_response, daemon=True).start()
+    
+    def add_message(self, sender: str, message: str):
+        """Add a message to the chat display."""
+        self.llm_response.config(state='normal')
+        self.llm_response.insert(tk.END, f"{sender}: {message}\n\n")
+        self.llm_response.see(tk.END)
+        self.llm_response.config(state='disabled')
     
     def show_captured_data(self):
         """Show a professional interface for viewing all captured data."""
